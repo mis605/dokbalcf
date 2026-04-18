@@ -53,12 +53,113 @@ export async function onRequestCore({ request, env }) {
       }
 
       case "uploadCSVToBQ": {
-        // Implementasi parsing CSV dan INSERT ke D1 ada di sini (hanya placeholder logika dasar)
-        /* 
-          Untuk Cloudflare, metode tercepat upload CSV jumlah besar adalah menjadikannya batch INSERT.
-          Kita menyarankan proses ini tetap menggunakan logic string/split seperti di GAS.
-        */
-        return new Response(JSON.stringify({ result: "Success - Fitur Bulk Upload Siap Diintegrasikan" }), {
+        const csvText = payload.csvContent;
+        if (!csvText) throw new Error("File CSV kosong.");
+
+        // Pisahkan baris
+        let lines = csvText.split(/\r?\n/).filter(line => line.trim().length > 0);
+        if (lines.length < 2) throw new Error("CSV hanya berisi header, tidak ada data.");
+        
+        // Hapus anomali Excel "sep=," di baris pertama
+        if (lines[0].includes("sep=")) lines.shift();
+        
+        // Baca header CSV untuk mendeteksi indeks setiap kolom
+        const headers = lines[0].split(",");
+        
+        // Fungsi helper buat identifikasi header alias
+        const getIdx = (aliasArr) => {
+          return headers.findIndex(h => aliasArr.some(a => h.toLowerCase().includes(a)));
+        };
+
+        const idxMap = {
+          id: getIdx(["id", "pkwt"]),
+          nrk: getIdx(["nrk"]),
+          nama: getIdx(["nama"]),
+          client: getIdx(["client"]),
+          jenis: getIdx(["jenis"]),
+          status: getIdx(["status_pkwt", "status"]),
+          awal: getIdx(["awal"]),
+          akhir: getIdx(["akhir"]),
+          kembali: getIdx(["kembali"]),
+          scan: getIdx(["scan_dokumen", "tgl scan", "tanggal_scan"]),
+          filling: getIdx(["filling", "tgl filling", "tanggal_filling"]),
+          upload: getIdx(["upload", "tgl upload", "tanggal_upload"]),
+          keterangan: getIdx(["keterangan"]),
+          // Asumsi jika dari BQ: ada jabatan, lokasi, dll
+          jabatan: getIdx(["jabatan"]),
+          lokasi: getIdx(["lokasi"]),
+          sub_branch: getIdx(["sub_branch", "sub branch"]),
+          branch: getIdx(["branch"]),
+          pembuatan: getIdx(["pembuatan", "tanggal_pembuatan"]),
+          terima: getIdx(["terima", "terima_oleh"]),
+          kirim: getIdx(["kirim", "tanggal_kirim"]),
+          pic: getIdx(["pic", "pic_pkwt"])
+        };
+
+        if (idxMap.id === -1) throw new Error("Kolom ID PKWT tidak ditemukan di file CSV.");
+
+        // Persiapkan D1 batch statements
+        const statements = [];
+        
+        // Parsing Regex untuk menghancurkan koma di dalam tanda kutip ganda ("Client, PT")
+        const parseCSVRow = (line) => {
+           let cols = [], curr = '', inQuotes = false;
+           for(let i=0; i<line.length; i++) {
+             const c = line[i];
+             if(c === '"' && line[i+1] === '"') { curr += '"'; i++; } // Escaped quote
+             else if(c === '"') { inQuotes = !inQuotes; }
+             else if(c === ',' && !inQuotes) { cols.push(curr); curr = ''; }
+             else { curr += c; }
+           }
+           cols.push(curr);
+           return cols;
+        };
+
+        for (let i = 1; i < lines.length; i++) {
+          const row = parseCSVRow(lines[i]);
+          const d = (key) => {
+            const index = idxMap[key];
+            if (index === -1 || row[index] === undefined) return null;
+            const val = row[index].trim();
+            return val === "" ? null : val;
+          };
+
+          const idPkwt = d("id");
+          if (!idPkwt) continue;
+
+          // Buat statement INSERT OR REPLACE
+          const stmt = env.DB.prepare(`
+            INSERT INTO pkwt (
+              id_pkwt, nrk, nama_karyawan, client, jenis_surat, status, awal_kontrak, akhir_kontrak,
+              tanggal_kembali, tanggal_scan, tanggal_filling, tanggal_upload, keterangan_upload,
+              jabatan, lokasi, sub_branch, branch, tanggal_pembuatan, terima_oleh, tanggal_kirim, pic_pkwt
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id_pkwt) DO UPDATE SET
+              tanggal_kembali = excluded.tanggal_kembali,
+              tanggal_scan = excluded.tanggal_scan,
+              tanggal_filling = excluded.tanggal_filling,
+              tanggal_upload = excluded.tanggal_upload,
+              keterangan_upload = excluded.keterangan_upload
+          `).bind(
+            idPkwt, d("nrk"), d("nama"), d("client"), d("jenis"), d("status"), d("awal"), d("akhir"),
+            d("kembali"), d("scan"), d("filling"), d("upload"), d("keterangan"),
+            d("jabatan"), d("lokasi"), d("sub_branch"), d("branch"), d("pembuatan"), d("terima"), d("kirim"), d("pic")
+          );
+
+          statements.push(stmt);
+        }
+
+        // Eksekusi D1 Batch Insert
+        // D1 Batch optimalnya per 100 baris agar tidak hit limits
+        const chunkSize = 100;
+        let successCount = 0;
+        for (let i = 0; i < statements.length; i += chunkSize) {
+          const chunk = statements.slice(i, i + chunkSize);
+          await env.DB.batch(chunk);
+          successCount += chunk.length;
+        }
+
+        return new Response(JSON.stringify({ result: `Sukses menyimpan ${successCount} data ke Database D1.` }), {
           headers: { "Content-Type": "application/json" }
         });
       }
